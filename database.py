@@ -460,14 +460,19 @@ async def get_conversations(tool_id: Optional[int] = None) -> List[Conversation]
         else:
             cursor = await db.execute("SELECT * FROM conversations ORDER BY updated_at DESC")
         rows = await cursor.fetchall()
-        return [Conversation(
-            id=row["id"],
-            tool_id=row["tool_id"],
-            title=row["title"],
-            messages=json.loads(row["messages"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"]
-        ) for row in rows]
+        result = []
+        for row in rows:
+            raw_messages = json.loads(row["messages"])
+            messages = [Message(**msg) if isinstance(msg, dict) else msg for msg in raw_messages]
+            result.append(Conversation(
+                id=row["id"],
+                tool_id=row["tool_id"],
+                title=row["title"],
+                messages=messages,
+                created_at=row["created_at"],
+                updated_at=row["updated_at"]
+            ))
+        return result
 
 
 async def get_conversation(id: int) -> Optional[Conversation]:
@@ -477,11 +482,14 @@ async def get_conversation(id: int) -> Optional[Conversation]:
         cursor = await db.execute("SELECT * FROM conversations WHERE id = ?", (id,))
         row = await cursor.fetchone()
         if row:
+            raw_messages = json.loads(row["messages"])
+            # 将dict转换为Message对象
+            messages = [Message(**msg) if isinstance(msg, dict) else msg for msg in raw_messages]
             return Conversation(
                 id=row["id"],
                 tool_id=row["tool_id"],
                 title=row["title"],
-                messages=json.loads(row["messages"]),
+                messages=messages,
                 created_at=row["created_at"],
                 updated_at=row["updated_at"]
             )

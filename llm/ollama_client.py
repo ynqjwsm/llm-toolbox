@@ -74,11 +74,17 @@ class OllamaClient(BaseLLMClient):
         if image_base64:
             images.append(image_base64)
         elif image_url:
-            # 需要先获取图片并转为base64
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(image_url)
+            if image_url.startswith("data:"):
+                # Data URI: 提取base64部分
                 import base64
-                images.append(base64.b64encode(resp.content).decode())
+                header, data = image_url.split(",", 1)
+                images.append(data)
+            else:
+                # HTTP URL: 需要先获取图片并转为base64
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(image_url)
+                    import base64
+                    images.append(base64.b64encode(resp.content).decode())
 
         if images and api_messages:
             # Ollama的图片格式：在消息中添加images字段

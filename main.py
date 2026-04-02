@@ -1,5 +1,6 @@
 """LLM工具箱Web应用"""
 import logging
+import os
 import shutil
 import asyncio
 from pathlib import Path
@@ -109,6 +110,45 @@ async def remove_endpoint(id: int):
     if not await delete_endpoint(id):
         raise HTTPException(status_code=404, detail="端点不存在")
     return {"message": "删除成功"}
+
+
+@app.post("/api/endpoints/test")
+async def test_endpoint_connection(endpoint: EndpointConfig):
+    """测试端点连接"""
+    try:
+        if endpoint.endpoint_type == EndpointType.OLLAMA:
+            # Ollama: /api/tags
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{endpoint.api_url.rstrip('/')}/api/tags")
+                response.raise_for_status()
+                data = response.json()
+                model_count = len(data.get("models", []))
+        else:
+            # OpenAI格式: /v1/models
+            base_url = endpoint.api_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url = f"{base_url}/v1"
+
+            headers = {"Content-Type": "application/json"}
+            if endpoint.api_key:
+                headers["Authorization"] = f"Bearer {endpoint.api_key}"
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{base_url}/models", headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                model_count = len(data.get("data", []))
+
+        return {"success": True, "model_count": model_count, "message": "连接成功"}
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=400, detail="连接超时")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"连接失败: HTTP {e.response.status_code}")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=400, detail="无法连接到服务器")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"连接失败: {str(e)}")
 
 
 @app.post("/api/endpoints/{id}/fetch-models")
@@ -533,11 +573,16 @@ async def chat_stream(request: ChatRequest):
 
 def main():
     """启动应用"""
+    host = os.getenv("APP_HOST", "0.0.0.0")
+    port = int(os.getenv("APP_PORT", "8000"))
+    reload = os.getenv("APP_RELOAD", "false").lower() == "true"
+
+    logger.info(f"启动服务: {host}:{port}, reload={reload}")
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
+        host=host,
+        port=port,
+        reload=reload
     )
 
 

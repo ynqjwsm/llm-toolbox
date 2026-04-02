@@ -1,4 +1,10 @@
-// LLM工具箱前端交互逻辑
+// LLM工具箱 - 前端交互逻辑
+
+// 唯一ID计数器
+let idCounter = 0;
+function generateId(prefix) {
+    return `${prefix}-${Date.now()}-${++idCounter}`;
+}
 
 // 状态管理
 let currentTool = null;
@@ -8,10 +14,23 @@ let uploadedImageUrl = null;
 let endpoints = [];
 let models = [];
 
-// ASR专用状态
+// 流式输出控制
+let currentAbortController = null;
+let currentStreamReader = null;
+let currentAssistantDiv = null;
+let currentContent = '';
+
+// ASR状态
 let asrPendingFiles = [];
 let asrResults = [];
 let isASRProcessing = false;
+let asrAbortController = null;
+
+// OCR状态
+let ocrPendingFiles = [];
+let ocrResults = [];
+let isOCRProcessing = false;
+let ocrAbortController = null;
 
 // 端点模态框状态
 let currentEndpointId = null;
@@ -52,16 +71,30 @@ function setupEventListeners() {
 
 // ========== Toast提示 ==========
 
+let toastTimeout = null;
+
 function showToast(message, type = 'success') {
     const toast = document.getElementById('toast');
     const icon = document.getElementById('toast-icon');
     const msg = document.getElementById('toast-message');
 
-    toast.className = `toast border-0 shadow toast-${type}`;
-    icon.className = type === 'success' ? 'bi bi-check-circle-fill text-success' : 'bi bi-exclamation-circle-fill text-danger';
+    toast.className = `toast-box toast-${type}`;
+    icon.textContent = type === 'success' ? '\u2713' : '\u00D7';
     msg.textContent = message;
 
-    bootstrap.Toast.getOrCreateInstance(toast).show();
+    // Reset animation
+    toast.classList.remove('toast-show');
+    void toast.offsetWidth; // Force reflow
+    toast.classList.add('toast-show');
+
+    // Clear previous timeout
+    if (toastTimeout) clearTimeout(toastTimeout);
+
+    // Auto hide after 2.5s
+    toastTimeout = setTimeout(() => {
+        toast.classList.remove('toast-show');
+        toast.classList.add('toast-hide');
+    }, 2500);
 }
 
 // ========== 端点管理 ==========
@@ -80,19 +113,21 @@ async function loadEndpoints() {
 function renderEndpointList() {
     const list = document.getElementById('endpoint-list');
     if (endpoints.length === 0) {
-        list.innerHTML = '<div class="text-muted small text-center py-2">暂无端点</div>';
+        list.innerHTML = '<div class="empty-item">暂无端点</div>';
         return;
     }
     list.innerHTML = endpoints.map(ep => `
-        <div class="list-group-item d-flex justify-content-between align-items-center" onclick="showEndpointModal(${ep.id})">
-            <div>
-                <i class="bi bi-hdd-stack me-1 text-secondary"></i>
-                <span>${ep.name}</span>
+        <div class="sidebar-item" onclick="showEndpointModal(${ep.id})" title="${ep.endpoint_type}: ${ep.api_url}">
+            <div class="item-left">
+                <div class="item-icon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                </div>
+                <span class="item-name">${escapeHtml(ep.name)}</span>
             </div>
-            <div class="d-flex align-items-center gap-1">
-                <span class="badge bg-secondary">${ep.model_count} 模型</span>
-                <button class="btn btn-sm btn-link text-danger delete-btn" onclick="deleteEndpoint(${ep.id}, event)">
-                    <i class="bi bi-trash"></i>
+            <div class="item-right">
+                <span class="badge-count">${ep.model_count}</span>
+                <button class="item-btn danger" onclick="deleteEndpoint(${ep.id}, event)" title="删除">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
             </div>
         </div>
@@ -106,19 +141,19 @@ function updateEndpointSelect() {
         return;
     }
     select.innerHTML = '<option value="">-- 请选择端点 --</option>' +
-        endpoints.map(ep => `<option value="${ep.id}">${ep.name}</option>`).join('');
+        endpoints.map(ep => `<option value="${ep.id}">${escapeHtml(ep.name)}</option>`).join('');
 }
 
 function showEndpointModal(id = null) {
     const modal = new bootstrap.Modal(document.getElementById('endpointModal'));
     document.getElementById('endpointModalTitle').innerHTML = id
-        ? '<i class="bi bi-hdd-stack me-2 text-primary"></i>编辑端点'
-        : '<i class="bi bi-hdd-stack me-2 text-primary"></i>添加端点';
+        ? '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg> 编辑端点'
+        : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg> 添加端点';
 
     currentEndpointId = id;
     document.getElementById('endpoint-form').reset();
     document.getElementById('fetch-models-btn').disabled = true;
-    document.getElementById('model-empty-hint').style.display = 'block';
+    document.getElementById('model-empty-hint').style.display = 'flex';
     document.getElementById('fetched-models-list').style.display = 'none';
     document.getElementById('saved-models-list').style.display = 'none';
     fetchedModels = [];
@@ -186,25 +221,36 @@ async function testEndpoint() {
         return;
     }
 
+    const testBtn = document.querySelector('button[onclick="testEndpoint()"]');
+    testBtn.disabled = true;
+    testBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" style="width:12px;height:12px;"></span> 测试中...';
+
     try {
-        let testUrl = endpointType === 'ollama'
-            ? `${apiUrl.replace(/\/$/, '')}/api/tags`
-            : `${apiUrl.replace(/\/$/, '')}/v1/models`;
+        const response = await fetch('/api/endpoints/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                name: 'test',
+                endpoint_type: endpointType,
+                api_url: apiUrl,
+                api_key: apiKey || null
+            })
+        });
 
-        const headers = { 'Content-Type': 'application/json' };
-        if (endpointType === 'openai' && apiKey) {
-            headers['Authorization'] = `Bearer ${apiKey}`;
-        }
-
-        const response = await fetch(testUrl, { headers });
         if (response.ok) {
-            showToast('连接成功');
+            const data = await response.json();
+            showToast(`连接成功，发现 ${data.model_count} 个模型`);
         } else {
-            showToast(`连接失败: ${response.status}`, 'error');
+            const error = await response.json();
+            showToast(error.detail || '连接失败', 'error');
         }
     } catch (error) {
+        console.error('测试连接失败:', error);
         showToast('连接失败', 'error');
     }
+
+    testBtn.disabled = false;
+    testBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg> 测试连接';
 }
 
 async function deleteEndpoint(id, event) {
@@ -244,14 +290,10 @@ async function loadSavedModels(endpointId) {
         if (savedModels.length > 0) {
             document.getElementById('saved-models-list').style.display = 'block';
             document.getElementById('saved-models-container').innerHTML = savedModels.map(m => `
-                <div class="list-group-item d-flex justify-content-between align-items-center">
-                    <div>
-                        <i class="bi bi-cpu me-1 text-secondary"></i>
-                        <span>${m.display_name || m.model_name}</span>
-                        ${m.display_name ? `<small class="text-muted ms-1">(${m.model_name})</small>` : ''}
-                    </div>
-                    <button class="btn btn-sm btn-link text-danger" onclick="deleteModel(${m.id})">
-                        <i class="bi bi-trash"></i>
+                <div class="saved-model-item">
+                    <span class="saved-model-name">${escapeHtml(m.display_name || m.model_name)}${m.display_name ? ` <span style="opacity:0.4">(${escapeHtml(m.model_name)})</span>` : ''}</span>
+                    <button class="saved-model-remove" onclick="deleteModel(${m.id})">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                     </button>
                 </div>
             `).join('');
@@ -271,9 +313,14 @@ async function fetchModels() {
 
     const btn = document.getElementById('fetch-models-btn');
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>拉取中...';
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" style="width:10px;height:10px;"></span> 拉取中...';
 
     try {
+        const savedResponse = await fetch('/api/models');
+        const allModels = await savedResponse.json();
+        const savedModels = allModels.filter(m => m.endpoint_id === currentEndpointId);
+        const savedModelNames = new Set(savedModels.map(m => m.model_name));
+
         const response = await fetch(`/api/endpoints/${currentEndpointId}/fetch-models`, {
             method: 'POST'
         });
@@ -282,38 +329,62 @@ async function fetchModels() {
 
         if (response.ok) {
             fetchedModels = data.models;
+            const fetchedModelIds = new Set(fetchedModels.map(m => m.id));
+
+            const modelsToRemove = savedModels.filter(m => !fetchedModelIds.has(m.model_name));
+            let removedCount = 0;
+            for (const model of modelsToRemove) {
+                try {
+                    const delResponse = await fetch(`/api/models/${model.id}`, { method: 'DELETE' });
+                    if (delResponse.ok) removedCount++;
+                } catch (e) {
+                    console.error(`删除模型 ${model.model_name} 失败:`, e);
+                }
+            }
+
+            await loadModels();
+
             document.getElementById('model-empty-hint').style.display = 'none';
             document.getElementById('fetched-models-list').style.display = 'block';
 
             if (fetchedModels.length === 0) {
                 document.getElementById('fetched-models-list').innerHTML =
-                    '<div class="text-center text-muted py-3">未找到可用模型</div>';
+                    '<div class="empty-item">未找到可用模型</div>';
             } else {
+                const updatedSavedModels = models.filter(m => m.endpoint_id === currentEndpointId);
+                const updatedSavedNames = new Set(updatedSavedModels.map(m => m.model_name));
+
                 document.getElementById('fetched-models-list').innerHTML = `
-                    <div class="p-2 bg-light rounded mb-2">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="select-all-models" onchange="toggleAllModels()">
-                            <label class="form-check-label small" for="select-all-models">全选 (${fetchedModels.length} 个模型)</label>
-                        </div>
+                    <div class="select-all-bar">
+                        <input type="checkbox" id="select-all-models" onchange="toggleAllModels()">
+                        <label for="select-all-models">全选（${fetchedModels.length} 个模型）</label>
                     </div>
-                    <div class="model-checkbox-list" style="max-height: 200px; overflow-y: auto;">
+                    <div class="model-checkbox-list">
                         ${fetchedModels.map(m => `
-                            <div class="list-group-item border-0">
-                                <div class="form-check">
-                                    <input class="form-check-input model-checkbox" type="checkbox" value="${m.id}" data-name="${m.name}" id="model-${m.id}">
-                                    <label class="form-check-label" for="model-${m.id}">${m.name}</label>
-                                </div>
+                            <div class="model-checkbox-item">
+                                <input type="checkbox" class="model-checkbox"
+                                       value="${m.id}" data-name="${m.name}" id="model-${m.id}"
+                                       ${updatedSavedNames.has(m.name) ? 'checked' : ''}>
+                                <label for="model-${m.id}">
+                                    ${escapeHtml(m.name)}
+                                    ${updatedSavedNames.has(m.name) ? '<span class="badge-mini badge-chat" style="margin-left:6px;">已添加</span>' : ''}
+                                </label>
                             </div>
                         `).join('')}
                     </div>
-                    <div class="p-2 border-top">
-                        <button class="btn btn-primary btn-sm w-100" onclick="addSelectedModels()">
-                            <i class="bi bi-plus-lg me-1"></i>添加选中模型
-                        </button>
-                    </div>
+                    <button class="add-selected-btn" onclick="addSelectedModels()">
+                        添加选中的模型
+                    </button>
                 `;
             }
-            showToast(`获取到 ${fetchedModels.length} 个模型`);
+
+            await loadSavedModels(currentEndpointId);
+
+            let message = `获取到 ${fetchedModels.length} 个模型`;
+            if (removedCount > 0) {
+                message += `，已删除 ${removedCount} 个不存在的模型`;
+            }
+            showToast(message);
         } else {
             showToast(data.detail || '拉取失败', 'error');
         }
@@ -323,7 +394,7 @@ async function fetchModels() {
     }
 
     btn.disabled = false;
-    btn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>拉取模型列表';
+    btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 拉取';
 }
 
 function toggleAllModels() {
@@ -344,18 +415,37 @@ async function addSelectedModels() {
         return;
     }
 
+    const existingModels = models.filter(m => m.endpoint_id === currentEndpointId);
+    const existingNames = new Set(existingModels.map(m => m.model_name));
+    const newModels = selected.filter(name => !existingNames.has(name));
+    const alreadyAdded = selected.filter(name => existingNames.has(name));
+
+    if (newModels.length === 0) {
+        showToast('所选模型均已添加', 'error');
+        return;
+    }
+
     try {
         const response = await fetch(`/api/endpoints/${currentEndpointId}/models/batch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(selected)
+            body: JSON.stringify(newModels)
         });
 
         if (response.ok) {
             const data = await response.json();
-            showToast(`已添加 ${data.added} 个模型`);
             await loadModels();
             await loadSavedModels(currentEndpointId);
+            document.querySelectorAll('.model-checkbox').forEach(cb => {
+                if (newModels.includes(cb.dataset.name)) {
+                    cb.checked = true;
+                }
+            });
+            let message = `已添加 ${data.added} 个模型`;
+            if (alreadyAdded.length > 0) {
+                message += `，${alreadyAdded.length} 个已存在`;
+            }
+            showToast(message);
         } else {
             const error = await response.json();
             showToast(error.detail || '添加失败', 'error');
@@ -399,7 +489,7 @@ async function loadEndpointModels() {
     }
 
     modelSelect.innerHTML = endpointModels.map(m =>
-        `<option value="${m.id}">${m.display_name || m.model_name}</option>`
+        `<option value="${m.id}">${escapeHtml(m.display_name || m.model_name)}</option>`
     ).join('');
 }
 
@@ -418,7 +508,7 @@ async function loadTools() {
 function renderToolList(tools) {
     const list = document.getElementById('tool-list');
     if (tools.length === 0) {
-        list.innerHTML = '<div class="text-muted small text-center py-2">暂无工具</div>';
+        list.innerHTML = '<div class="empty-item">暂无工具</div>';
         return;
     }
     list.innerHTML = tools.map(tool => {
@@ -427,20 +517,20 @@ function renderToolList(tools) {
         const endpointName = model ? (endpoints.find(ep => ep.id === model.endpoint_id)?.name || '') : '';
         const tooltipInfo = `模型: ${modelName}\n端点: ${endpointName}\n类型: ${tool.tool_type}`;
         return `
-            <div class="list-group-item ${currentTool?.id === tool.id ? 'active' : ''}"
+            <div class="sidebar-item ${currentTool?.id === tool.id ? 'active' : ''}"
                  onclick="selectTool(${tool.id})"
                  title="${tooltipInfo}">
-                <div>
-                    <i class="bi bi-${getToolIcon(tool.tool_type)} me-1"></i>
-                    <span>${tool.name}</span>
+                <div class="item-left">
+                    <div class="item-icon">${getToolIconSVG(tool.tool_type)}</div>
+                    <span class="item-name">${escapeHtml(tool.name)}</span>
                 </div>
-                <div class="d-flex align-items-center gap-1">
-                    <span class="badge ${tool.tool_type}">${tool.tool_type}</span>
-                    <button class="btn btn-sm btn-link edit-btn ${currentTool?.id === tool.id ? 'text-white' : 'text-secondary'}" onclick="showToolModal(${tool.id}, event)" title="编辑">
-                        <i class="bi bi-pencil"></i>
+                <div class="item-right">
+                    <span class="badge-mini badge-${tool.tool_type}">${tool.tool_type}</span>
+                    <button class="item-btn" onclick="showToolModal(${tool.id}, event)" title="编辑">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                     </button>
-                    <button class="btn btn-sm btn-link delete-btn ${currentTool?.id === tool.id ? 'text-white' : 'text-danger'}" onclick="deleteTool(${tool.id}, event)" title="删除">
-                        <i class="bi bi-trash"></i>
+                    <button class="item-btn danger" onclick="deleteTool(${tool.id}, event)" title="删除">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                     </button>
                 </div>
             </div>
@@ -448,9 +538,14 @@ function renderToolList(tools) {
     }).join('');
 }
 
-function getToolIcon(type) {
-    const icons = { chat: 'chat-dots', thinking: 'lightbulb', ocr: 'eye', asr: 'mic' };
-    return icons[type] || 'app';
+function getToolIconSVG(type) {
+    const icons = {
+        chat: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+        thinking: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>',
+        ocr: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+        asr: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>'
+    };
+    return icons[type] || '';
 }
 
 function showToolModal(id = null, event = null) {
@@ -459,8 +554,8 @@ function showToolModal(id = null, event = null) {
     }
     const modal = new bootstrap.Modal(document.getElementById('toolModal'));
     document.getElementById('toolModalTitle').innerHTML = id
-        ? '<i class="bi bi-app-indicator me-2 text-primary"></i>编辑工具'
-        : '<i class="bi bi-app-indicator me-2 text-primary"></i>创建工具';
+        ? '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 编辑工具'
+        : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 创建工具';
     document.getElementById('tool-id').value = id || '';
     document.getElementById('tool-form').reset();
 
@@ -477,7 +572,6 @@ function showToolModal(id = null, event = null) {
                 document.getElementById('tool-prompt').value = tool.system_prompt || '';
                 document.getElementById('tool-description').value = tool.description || '';
 
-                // 设置端点和模型
                 const model = models.find(m => m.id === tool.model_id);
                 if (model) {
                     document.getElementById('tool-endpoint').value = model.endpoint_id;
@@ -572,28 +666,47 @@ async function selectTool(id) {
     try {
         const response = await fetch(`/api/tools/${id}`);
         const tool = await response.json();
+
+        // 停止当前正在进行的操作
+        if (isStreaming && currentAbortController) currentAbortController.abort();
+        if (isASRProcessing && asrAbortController) asrAbortController.abort();
+        if (isOCRProcessing && ocrAbortController) ocrAbortController.abort();
+
         currentTool = tool;
         currentConversationId = null;
         asrPendingFiles = [];
         asrResults = [];
+        ocrPendingFiles = [];
+        ocrResults = [];
+        isStreaming = false;
+        isASRProcessing = false;
+        isOCRProcessing = false;
+        currentStreamReader = null;
 
         renderToolList(await (await fetch('/api/tools')).json());
 
         document.getElementById('tool-header').style.display = 'flex';
         document.getElementById('current-tool-name').textContent = tool.name;
         document.getElementById('current-tool-type').textContent = tool.tool_type;
-        document.getElementById('current-tool-type').className = `badge ${tool.tool_type}`;
+        document.getElementById('current-tool-type').className = `tool-type-badge ${tool.tool_type}`;
 
         if (tool.tool_type === 'asr') {
             document.getElementById('chat-input-area').style.display = 'none';
+            document.getElementById('ocr-upload-area').style.display = 'none';
             document.getElementById('asr-upload-area').style.display = 'block';
             updateASRFileList();
+        } else if (tool.tool_type === 'ocr') {
+            document.getElementById('chat-input-area').style.display = 'none';
+            document.getElementById('asr-upload-area').style.display = 'none';
+            document.getElementById('ocr-upload-area').style.display = 'block';
+            updateOCRFileList();
         } else {
             document.getElementById('asr-upload-area').style.display = 'none';
+            document.getElementById('ocr-upload-area').style.display = 'none';
             document.getElementById('chat-input-area').style.display = 'block';
             document.getElementById('chat-input').disabled = false;
-            document.getElementById('send-btn').disabled = false;
-            document.getElementById('image-upload-area').style.display = tool.tool_type === 'ocr' ? 'block' : 'none';
+            document.getElementById('image-upload-area').style.display = 'none';
+            updateSendButtonState();
         }
 
         clearChat();
@@ -607,28 +720,26 @@ function resetChatUI() {
     document.getElementById('tool-header').style.display = 'none';
     document.getElementById('chat-input-area').style.display = 'none';
     document.getElementById('asr-upload-area').style.display = 'none';
+    document.getElementById('ocr-upload-area').style.display = 'none';
     document.getElementById('chat-messages').innerHTML = `
-        <div class="welcome-card text-center py-5">
-            <div class="mb-4"><i class="bi bi-robot display-1 text-primary opacity-25"></i></div>
-            <h4 class="text-muted mb-3">欢迎使用LLM工具箱</h4>
-            <p class="text-muted mb-4">选择左侧工具开始对话，或配置端点和模型</p>
-            <div class="row g-3 justify-content-center">
-                <div class="col-auto">
-                    <div class="card feature-card h-100 border-0 shadow-sm" onclick="showToolModal()">
-                        <div class="card-body text-center p-3">
-                            <i class="bi bi-plus-circle fs-3 text-primary mb-2"></i>
-                            <p class="small text-muted mb-0">创建工具</p>
-                        </div>
+        <div class="welcome-screen">
+            <div class="welcome-grid">
+                <div class="welcome-card" onclick="showToolModal()">
+                    <div class="card-icon icon-chat">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                     </div>
+                    <span class="card-label">创建工具</span>
                 </div>
-                <div class="col-auto">
-                    <div class="card feature-card h-100 border-0 shadow-sm" onclick="showEndpointModal()">
-                        <div class="card-body text-center p-3">
-                            <i class="bi bi-hdd-stack fs-3 text-secondary mb-2"></i>
-                            <p class="small text-muted mb-0">添加端点</p>
-                        </div>
+                <div class="welcome-card" onclick="showEndpointModal()">
+                    <div class="card-icon icon-endpoint">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
                     </div>
+                    <span class="card-label">添加端点</span>
                 </div>
+            </div>
+            <div class="welcome-text">
+                <h1>LLM工具箱</h1>
+                <p>配置端点，创建工具，开始对话</p>
             </div>
         </div>
     `;
@@ -649,18 +760,22 @@ async function loadConversations(toolId) {
 function renderConversationList(conversations) {
     const list = document.getElementById('conversation-list');
     if (conversations.length === 0) {
-        list.innerHTML = '<div class="text-muted small text-center py-2">暂无对话</div>';
+        list.innerHTML = '<div class="empty-item">暂无对话</div>';
         return;
     }
     list.innerHTML = conversations.map(conv => `
-        <div class="list-group-item ${currentConversationId === conv.id ? 'active' : ''}" onclick="loadConversation(${conv.id})">
-            <div>
-                <i class="bi bi-chat-text me-1 text-secondary"></i>
-                <span class="small">${conv.title || '对话'}</span>
+        <div class="sidebar-item ${currentConversationId === conv.id ? 'active' : ''}" onclick="loadConversation(${conv.id})" title="${escapeHtml(conv.title || '对话')}">
+            <div class="item-left">
+                <div class="item-icon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                </div>
+                <span class="item-name">${escapeHtml(conv.title || '对话')}</span>
             </div>
-            <button class="btn btn-sm btn-link text-danger delete-btn" onclick="deleteConversation(${conv.id}, event)">
-                <i class="bi bi-trash"></i>
-            </button>
+            <div class="item-right">
+                <button class="item-btn danger" onclick="deleteConversation(${conv.id}, event)" title="删除">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+            </div>
         </div>
     `).join('');
 }
@@ -704,8 +819,22 @@ async function deleteConversation(id, event) {
 function clearChat() {
     currentConversationId = null;
     asrResults = [];
+    ocrResults = [];
+    isASRProcessing = false;
+    isOCRProcessing = false;
+    if (asrAbortController) asrAbortController.abort();
+    if (ocrAbortController) ocrAbortController.abort();
+    asrPendingFiles = [];
+    ocrPendingFiles = [];
     document.getElementById('chat-messages').innerHTML = '';
     removeImage();
+    // Reset progress areas
+    const asrProgress = document.getElementById('asr-progress-area');
+    if (asrProgress) asrProgress.style.display = 'none';
+    const ocrProgress = document.getElementById('ocr-progress-area');
+    if (ocrProgress) ocrProgress.style.display = 'none';
+    updateASRFileList();
+    updateOCRFileList();
 }
 
 // ========== 图片处理 ==========
@@ -732,25 +861,6 @@ function removeImage() {
 }
 
 // ========== ASR文件处理 ==========
-
-function handleASRDragOver(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    document.getElementById('asr-drop-zone').classList.add('drag-over');
-}
-
-function handleASRDragLeave(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    document.getElementById('asr-drop-zone').classList.remove('drag-over');
-}
-
-function handleASRDrop(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    document.getElementById('asr-drop-zone').classList.remove('drag-over');
-    addASRFiles(event.dataTransfer.files);
-}
 
 function handleASRFileSelect(event) {
     addASRFiles(event.target.files);
@@ -779,51 +889,19 @@ function addASRFiles(files) {
 }
 
 function updateASRFileList() {
-    const listContainer = document.getElementById('asr-pending-list');
-    const list = document.getElementById('asr-pending-files');
-    const startBtn = document.getElementById('asr-start-btn');
+    const listContainer = document.getElementById('asr-pending-info');
+    const fileCountBadge = document.getElementById('asr-file-count');
 
     if (asrPendingFiles.length === 0) {
         listContainer.style.display = 'none';
-        startBtn.disabled = true;
+        updateASRButtonState();
         return;
     }
 
-    listContainer.style.display = 'block';
-    startBtn.disabled = isASRProcessing || asrPendingFiles.every(f => f.status === 'done' || f.status === 'error');
-
-    list.innerHTML = asrPendingFiles.map((f, idx) => `
-        <div class="list-group-item">
-            <div class="file-info">
-                <i class="bi bi-file-earmark-music file-icon"></i>
-                <div>
-                    <div class="file-name" title="${f.name}">${f.name}</div>
-                    <div class="file-size">${formatFileSize(f.size)}</div>
-                </div>
-            </div>
-            <div class="file-status">
-                ${getStatusBadge(f.status)}
-                ${f.status === 'pending' ? `<button class="btn btn-sm btn-link text-danger" onclick="removePendingFile(${idx})"><i class="bi bi-x-lg"></i></button>` : ''}
-            </div>
-        </div>
-    `).join('');
-}
-
-function getStatusBadge(status) {
-    const badges = {
-        pending: '<span class="badge bg-secondary">待处理</span>',
-        uploading: '<span class="badge bg-info">上传中...</span>',
-        processing: '<span class="badge bg-warning text-dark">识别中...</span>',
-        done: '<span class="badge bg-success">完成</span>',
-        error: '<span class="badge bg-danger">失败</span>'
-    };
-    return badges[status] || '';
-}
-
-function formatFileSize(bytes) {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    listContainer.style.display = 'flex';
+    const pendingCount = asrPendingFiles.filter(f => f.status === 'pending').length;
+    fileCountBadge.textContent = pendingCount;
+    updateASRButtonState();
 }
 
 function removePendingFile(idx) {
@@ -848,27 +926,31 @@ async function startASRBatch() {
     }
 
     isASRProcessing = true;
+    asrAbortController = new AbortController();
     asrResults = [];
 
     const progressArea = document.getElementById('asr-progress-area');
     const progressBar = document.getElementById('asr-progress-bar');
     const progressText = document.getElementById('asr-progress-text');
-    const progressCount = document.getElementById('asr-progress-count');
 
-    progressArea.style.display = 'block';
-    document.getElementById('asr-start-btn').disabled = true;
+    progressArea.style.display = 'flex';
+    updateASRButtonState();
 
     const messagesDiv = document.getElementById('chat-messages');
-    const welcome = messagesDiv.querySelector('.welcome-card');
+    const welcome = messagesDiv.querySelector('.welcome-screen');
     if (welcome) welcome.remove();
 
+    let processedCount = 0;
     for (let i = 0; i < pendingFiles.length; i++) {
-        const file = pendingFiles[i];
-        const fileIdx = asrPendingFiles.indexOf(file);
+        if (!isASRProcessing) {
+            progressText.textContent = '已停止';
+            break;
+        }
 
-        progressText.textContent = `正在处理: ${file.name}`;
-        progressCount.textContent = `${i + 1}/${pendingFiles.length}`;
+        const file = pendingFiles[i];
+
         progressBar.style.width = `${((i) / pendingFiles.length) * 100}%`;
+        progressText.textContent = `${i + 1}/${pendingFiles.length}`;
 
         file.status = 'uploading';
         updateASRFileList();
@@ -877,7 +959,11 @@ async function startASRBatch() {
             const formData = new FormData();
             formData.append('file', file.file);
 
-            const uploadResponse = await fetch('/api/audio/upload', { method: 'POST', body: formData });
+            const uploadResponse = await fetch('/api/audio/upload', {
+                method: 'POST',
+                body: formData,
+                signal: asrAbortController.signal
+            });
             const uploadData = await uploadResponse.json();
             if (!uploadResponse.ok) throw new Error(uploadData.detail || '上传失败');
 
@@ -893,7 +979,8 @@ async function startASRBatch() {
                     conversation_id: null,
                     message: '',
                     audio_url: file.path
-                })
+                }),
+                signal: asrAbortController.signal
             });
             const transcribeData = await transcribeResponse.json();
             if (!transcribeResponse.ok) throw new Error(transcribeData.detail || '转录失败');
@@ -902,23 +989,33 @@ async function startASRBatch() {
             file.result = transcribeData.text;
             asrResults.push({ filename: file.name, text: transcribeData.text });
             appendASRResult(file.name, transcribeData.text);
+            processedCount++;
 
         } catch (error) {
+            if (error.name === 'AbortError') {
+                file.status = 'pending';
+                progressText.textContent = '已停止';
+                break;
+            }
             console.error(`处理 ${file.name} 失败:`, error);
             file.status = 'error';
             file.result = error.message;
-            appendMessage('assistant', `❌ **${file.name}** 处理失败: ${error.message}`, false, null);
+            appendMessage('assistant', `**${file.name}** 处理失败: ${error.message}`, false, null);
         }
 
         updateASRFileList();
     }
 
     progressBar.style.width = '100%';
-    progressText.textContent = '处理完成';
+    if (isASRProcessing) {
+        progressText.textContent = '已完成';
+    }
 
     setTimeout(() => { progressArea.style.display = 'none'; }, 2000);
 
     isASRProcessing = false;
+    asrAbortController = null;
+    updateASRButtonState();
     updateASRFileList();
 
     if (asrResults.length > 0) {
@@ -926,59 +1023,358 @@ async function startASRBatch() {
     }
 }
 
+function stopASRBatch() {
+    if (!isASRProcessing) return;
+
+    isASRProcessing = false;
+    if (asrAbortController) {
+        asrAbortController.abort();
+    }
+    showToast('已停止处理');
+}
+
+function updateASRButtonState() {
+    const startBtn = document.getElementById('asr-start-btn');
+    const stopBtn = document.getElementById('asr-stop-btn');
+
+    if (isASRProcessing) {
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+    } else {
+        startBtn.style.display = 'block';
+        stopBtn.style.display = 'none';
+        startBtn.disabled = asrPendingFiles.filter(f => f.status === 'pending').length === 0;
+    }
+}
+
+// ========== OCR文件处理 ==========
+
+function handleOCRFileSelect(event) {
+    addOCRFiles(event.target.files);
+    event.target.value = '';
+}
+
+function addOCRFiles(files) {
+    const supportedFormats = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
+
+    for (const file of files) {
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+        if (!supportedFormats.includes(ext)) {
+            showToast(`不支持的格式: ${file.name}`, 'error');
+            continue;
+        }
+        if (ocrPendingFiles.some(f => f.name === file.name && f.size === file.size)) {
+            showToast(`文件已存在: ${file.name}`, 'error');
+            continue;
+        }
+        ocrPendingFiles.push({
+            file, name: file.name, size: file.size,
+            status: 'pending', result: null
+        });
+    }
+    updateOCRFileList();
+}
+
+function updateOCRFileList() {
+    const listContainer = document.getElementById('ocr-pending-info');
+    const fileCountBadge = document.getElementById('ocr-file-count');
+
+    if (ocrPendingFiles.length === 0) {
+        listContainer.style.display = 'none';
+        updateOCRButtonState();
+        return;
+    }
+
+    listContainer.style.display = 'flex';
+    const pendingCount = ocrPendingFiles.filter(f => f.status === 'pending').length;
+    fileCountBadge.textContent = pendingCount;
+    updateOCRButtonState();
+}
+
+function removeOCRFile(idx) {
+    ocrPendingFiles.splice(idx, 1);
+    updateOCRFileList();
+}
+
+function clearOCRFiles() {
+    ocrPendingFiles = [];
+    updateOCRFileList();
+}
+
+// ========== OCR批量处理 ==========
+
+async function startOCRBatch() {
+    if (!currentTool || isOCRProcessing) return;
+
+    const pendingFiles = ocrPendingFiles.filter(f => f.status === 'pending');
+    if (pendingFiles.length === 0) {
+        showToast('没有待处理的文件', 'error');
+        return;
+    }
+
+    isOCRProcessing = true;
+    ocrAbortController = new AbortController();
+    ocrResults = [];
+
+    const progressArea = document.getElementById('ocr-progress-area');
+    const progressBar = document.getElementById('ocr-progress-bar');
+    const progressText = document.getElementById('ocr-progress-text');
+
+    progressArea.style.display = 'flex';
+    updateOCRButtonState();
+
+    const messagesDiv = document.getElementById('chat-messages');
+    const welcome = messagesDiv.querySelector('.welcome-screen');
+    if (welcome) welcome.remove();
+
+    let processedCount = 0;
+    for (let i = 0; i < pendingFiles.length; i++) {
+        if (!isOCRProcessing) {
+            progressText.textContent = '已停止';
+            break;
+        }
+
+        const file = pendingFiles[i];
+
+        progressBar.style.width = `${((i) / pendingFiles.length) * 100}%`;
+        progressText.textContent = `${i + 1}/${pendingFiles.length}`;
+
+        file.status = 'processing';
+        updateOCRFileList();
+
+        try {
+            const imageData = await readFileAsBase64(file.file);
+
+            const assistantDiv = appendOCRResult(file.name, '', true);
+            let content = '';
+
+            const response = await fetch('/api/chat/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tool_id: currentTool.id,
+                    conversation_id: null,
+                    message: '请识别图片中的内容',
+                    image_url: imageData
+                }),
+                signal: ocrAbortController.signal
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let ocrBuffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                ocrBuffer += decoder.decode(value, { stream: true });
+                const lines = ocrBuffer.split('\n');
+                ocrBuffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (trimmed.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(trimmed.substring(6));
+                            if (data.error) {
+                                throw new Error(data.error);
+                            }
+                            if (data.content) {
+                                content += data.content;
+                                assistantDiv.querySelector('.message-content').innerHTML =
+                                    formatMarkdown(content) + '<span class="typing-indicator">\u258B</span>';
+                                scrollToBottom();
+                            }
+                            if (data.done) {
+                                assistantDiv.querySelector('.message-content').innerHTML = formatMarkdown(content);
+                            }
+                        } catch (e) {
+                            if (e.message && !e.name) {
+                                throw e; // 重新抛出业务错误
+                            }
+                            // 忽略解析错误
+                        }
+                    }
+                }
+            }
+
+            file.status = 'done';
+            file.result = content;
+            ocrResults.push({ filename: file.name, text: content });
+            updateOCRResultActions(assistantDiv, file.name, content);
+            processedCount++;
+
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                file.status = 'pending';
+                progressText.textContent = '已停止';
+                break;
+            }
+            console.error(`处理 ${file.name} 失败:`, error);
+            file.status = 'error';
+            file.result = error.message;
+            appendMessage('assistant', `**${file.name}** 处理失败: ${error.message}`, false, null);
+        }
+
+        updateOCRFileList();
+    }
+
+    progressBar.style.width = '100%';
+    if (isOCRProcessing) {
+        progressText.textContent = '已完成';
+    }
+
+    setTimeout(() => { progressArea.style.display = 'none'; }, 2000);
+
+    isOCRProcessing = false;
+    ocrAbortController = null;
+    updateOCRButtonState();
+    updateOCRFileList();
+
+    if (ocrResults.length > 0) {
+        showToast(`完成 ${ocrResults.length}/${pendingFiles.length} 个文件`);
+    }
+}
+
+function stopOCRBatch() {
+    if (!isOCRProcessing) return;
+
+    isOCRProcessing = false;
+    if (ocrAbortController) {
+        ocrAbortController.abort();
+    }
+    showToast('已停止处理');
+}
+
+function updateOCRButtonState() {
+    const startBtn = document.getElementById('ocr-start-btn');
+    const stopBtn = document.getElementById('ocr-stop-btn');
+
+    if (isOCRProcessing) {
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+    } else {
+        startBtn.style.display = 'block';
+        stopBtn.style.display = 'none';
+        startBtn.disabled = ocrPendingFiles.filter(f => f.status === 'pending').length === 0;
+    }
+}
+
+function readFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
 // ========== 消息显示 ==========
 
 function appendASRResult(filename, text) {
     const messagesDiv = document.getElementById('chat-messages');
-    const resultId = `asr-result-${Date.now()}`;
+    const resultId = generateId('asr-result');
 
     const div = document.createElement('div');
     div.className = 'message assistant';
     div.innerHTML = `
-        <div class="message-avatar"><i class="bi bi-robot"></i></div>
+        <div class="message-avatar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg></div>
         <div class="message-content-wrapper">
-            <div class="message-title"><i class="bi bi-file-earmark-music me-1"></i>${filename}</div>
-            <div class="message-content">${escapeHtml(text)}</div>
-            <div class="message-actions btn-group" role="group">
-                <button class="btn btn-outline-secondary" onclick="copyText('${resultId}')" title="复制文本">
-                    <i class="bi bi-clipboard"></i> 复制
+            <div class="message-title">${escapeHtml(filename)}</div>
+            <div class="message-content">${formatMarkdown(text)}</div>
+            <div class="message-actions">
+                <button class="btn" onclick="copyText('${resultId}')">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    复制
                 </button>
-                <div class="btn-group" role="group">
-                    <button class="btn btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown">
-                        <i class="bi bi-download"></i> 导出
-                    </button>
-                    <ul class="dropdown-menu">
-                        <li><a class="dropdown-item" href="#" onclick="exportAs('${resultId}', '${escapeAttr(filename)}', 'txt')">
-                            <i class="bi bi-filetype-txt me-1"></i>导出 TXT
-                        </a></li>
-                        <li><a class="dropdown-item" href="#" onclick="exportAs('${resultId}', '${escapeAttr(filename)}', 'docx')">
-                            <i class="bi bi-filetype-docx me-1"></i>导出 DOC
-                        </a></li>
-                    </ul>
-                </div>
             </div>
-            <textarea id="${resultId}" class="d-none">${escapeAttr(text)}</textarea>
         </div>
     `;
+    const textarea = document.createElement('textarea');
+    textarea.id = resultId;
+    textarea.className = 'd-none';
+    textarea.value = text;
+    div.querySelector('.message-content-wrapper').appendChild(textarea);
     messagesDiv.appendChild(div);
     scrollToBottom();
 }
 
+function appendOCRResult(filename, text, isStreaming = false) {
+    const messagesDiv = document.getElementById('chat-messages');
+    const resultId = generateId('ocr-result');
+
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    div.id = resultId + '-wrapper';
+    div.innerHTML = `
+        <div class="message-avatar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div>
+        <div class="message-content-wrapper">
+            <div class="message-title">${escapeHtml(filename)}</div>
+            <div class="message-content">${isStreaming ? '' : formatMarkdown(text)}${isStreaming ? '<span class="typing-indicator">\u258B</span>' : ''}</div>
+            <div class="message-actions" style="display: ${isStreaming ? 'none' : 'flex'};">
+                <button class="btn" onclick="copyOCRText('${resultId}')">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    复制
+                </button>
+            </div>
+        </div>
+    `;
+    const textarea = document.createElement('textarea');
+    textarea.id = resultId;
+    textarea.className = 'd-none';
+    textarea.value = text;
+    div.querySelector('.message-content-wrapper').appendChild(textarea);
+    messagesDiv.appendChild(div);
+    scrollToBottom();
+    return div;
+}
+
+function updateOCRResultActions(div, filename, text) {
+    const actionsDiv = div.querySelector('.message-actions');
+    const textarea = div.querySelector('textarea');
+    if (!textarea) return;
+
+    textarea.value = text;
+
+    actionsDiv.style.display = 'flex';
+    actionsDiv.innerHTML = `
+        <button class="btn" onclick="copyOCRText('${textarea.id}')">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            复制
+        </button>
+    `;
+}
+
+function copyOCRText(elementId) {
+    const textarea = document.getElementById(elementId);
+    if (!textarea) return;
+    navigator.clipboard.writeText(textarea.value).then(() => {
+        showToast('已复制到剪贴板');
+    }).catch(err => {
+        console.error('复制失败:', err);
+        showToast('复制失败', 'error');
+    });
+}
+
 function appendMessage(role, content, isStreaming = false, title = null) {
     const messagesDiv = document.getElementById('chat-messages');
-    const welcome = messagesDiv.querySelector('.welcome-card');
+    const welcome = messagesDiv.querySelector('.welcome-screen');
     if (welcome) welcome.remove();
 
     const div = document.createElement('div');
     div.className = `message ${role}`;
-    const avatarIcon = role === 'user' ? 'bi-person-fill' : 'bi-robot';
     const titleHtml = title ? `<div class="message-title">${title}</div>` : '';
 
+    const avatarSVG = role === 'user'
+        ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
+        : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/><path d="M8 16h.01"/><path d="M12 16h.01"/><path d="M16 16h.01"/></svg>';
+
     div.innerHTML = `
-        <div class="message-avatar"><i class="bi ${avatarIcon}"></i></div>
+        <div class="message-avatar">${avatarSVG}</div>
         <div class="message-content-wrapper">
             ${titleHtml}
-            <div class="message-content">${formatMarkdown(content)}${isStreaming ? '<span class="typing-indicator">▋</span>' : ''}</div>
+            <div class="message-content">${formatMarkdown(content)}${isStreaming ? '<span class="typing-indicator">\u258B</span>' : ''}</div>
         </div>
     `;
     messagesDiv.appendChild(div);
@@ -991,7 +1387,7 @@ function scrollToBottom() {
     container.scrollTop = container.scrollHeight;
 }
 
-// ========== 导出和复制功能 ==========
+// ========== 导出和复制 ==========
 
 function copyText(elementId) {
     const textarea = document.getElementById(elementId);
@@ -1004,38 +1400,6 @@ function copyText(elementId) {
     });
 }
 
-function exportAs(elementId, filename, format) {
-    const textarea = document.getElementById(elementId);
-    if (!textarea) return;
-
-    const text = textarea.value;
-    const baseName = filename.replace(/\.[^/.]+$/, '');
-
-    if (format === 'txt') {
-        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-        downloadBlob(blob, `${baseName}_转录.txt`);
-        showToast('已导出 TXT 文件');
-    } else if (format === 'docx') {
-        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${filename}</title></head>
-            <body><p style="white-space: pre-wrap; font-family: 'Microsoft YaHei', sans-serif;">${escapeHtml(text)}</p></body></html>`;
-        const blob = new Blob([html], { type: 'application/msword;charset=utf-8' });
-        downloadBlob(blob, `${baseName}_转录.doc`);
-        showToast('已导出 DOC 文件');
-    }
-    return false;
-}
-
-function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-}
-
 // ========== 工具函数 ==========
 
 function escapeHtml(text) {
@@ -1044,17 +1408,19 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function escapeAttr(text) {
-    return text.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
 function formatMarkdown(text) {
     if (!text) return '';
+    // 先转义HTML防止XSS
+    text = escapeHtml(text);
+    // 代码块（在转义后的文本上匹配）
     text = text.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
+    // 行内代码
     text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // 粗体和斜体
     text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     text = text.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    text = text.replace(/\n\n/g, '</p><p>');
+    // 段落（只处理不在pre标签内的换行）
+    text = text.replace(/((?:(?!<\/?pre>).)+)\n\n/g, '$1</p><p>');
     text = '<p>' + text + '</p>';
     return text;
 }
@@ -1072,10 +1438,13 @@ async function sendMessage() {
     input.value = '';
     input.style.height = 'auto';
 
-    const assistantDiv = appendMessage('assistant', '', true);
+    currentAssistantDiv = appendMessage('assistant', '', true);
+    currentContent = '';
 
     isStreaming = true;
-    document.getElementById('send-btn').disabled = true;
+    updateSendButtonState();
+
+    currentAbortController = new AbortController();
 
     try {
         const response = await fetch('/api/chat/stream', {
@@ -1086,49 +1455,90 @@ async function sendMessage() {
                 conversation_id: currentConversationId,
                 message: message,
                 image_url: currentTool.tool_type === 'ocr' ? uploadedImageUrl : null
-            })
+            }),
+            signal: currentAbortController.signal
         });
 
-        const reader = response.body.getReader();
+        currentStreamReader = response.body.getReader();
         const decoder = new TextDecoder();
-        let content = '';
+        let buffer = '';
 
         while (true) {
-            const { done, value } = await reader.read();
+            const { done, value } = await currentStreamReader.read();
             if (done) break;
 
-            const chunk = decoder.decode(value);
-            const lines = chunk.split('\n');
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            // 保留最后一个不完整的行
+            buffer = lines.pop() || '';
 
             for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = JSON.parse(line.substring(6));
-                    if (data.error) {
-                        assistantDiv.querySelector('.message-content').innerHTML =
-                            `<div class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>错误: ${data.error}</div>`;
-                        break;
-                    }
-                    if (data.content) {
-                        content += data.content;
-                        assistantDiv.querySelector('.message-content').innerHTML =
-                            formatMarkdown(content) + '<span class="typing-indicator">▋</span>';
-                        scrollToBottom();
-                    }
-                    if (data.done) {
-                        currentConversationId = data.conversation_id;
-                        assistantDiv.querySelector('.message-content').innerHTML = formatMarkdown(content);
-                        await loadConversations(currentTool.id);
+                const trimmed = line.trim();
+                if (trimmed.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(trimmed.substring(6));
+                        if (data.error) {
+                            throw new Error(data.error);
+                        }
+                        if (data.content) {
+                            currentContent += data.content;
+                            currentAssistantDiv.querySelector('.message-content').innerHTML =
+                                formatMarkdown(currentContent) + '<span class="typing-indicator">\u258B</span>';
+                            scrollToBottom();
+                        }
+                        if (data.done) {
+                            currentConversationId = data.conversation_id;
+                            currentAssistantDiv.querySelector('.message-content').innerHTML = formatMarkdown(currentContent);
+                            await loadConversations(currentTool.id);
+                        }
+                    } catch (e) {
+                        if (e.name === 'SyntaxError') continue; // 解析错误，忽略
+                        throw e; // 业务错误，向上抛出
                     }
                 }
             }
         }
     } catch (error) {
-        console.error('发送消息失败:', error);
-        assistantDiv.querySelector('.message-content').innerHTML =
-            `<div class="text-danger"><i class="bi bi-wifi-off me-1"></i>连接失败</div>`;
+        if (error.name === 'AbortError') {
+            currentAssistantDiv.querySelector('.message-content').innerHTML =
+                formatMarkdown(currentContent) + '<div style="color:var(--text-muted);font-size:11px;margin-top:6px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-1px;margin-right:4px;"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>已停止</div>';
+            showToast('已停止生成');
+        } else {
+            console.error('发送消息失败:', error);
+            currentAssistantDiv.querySelector('.message-content').innerHTML =
+                `<span style="color:var(--red)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M18.36 6.64A9 9 0 1 1 5.64 6.64"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>${currentContent ? '错误: ' + escapeHtml(error.message) : '连接失败'}</span>`;
+        }
     }
 
     isStreaming = false;
-    document.getElementById('send-btn').disabled = false;
+    currentAbortController = null;
+    currentStreamReader = null;
+    updateSendButtonState();
     removeImage();
+}
+
+function stopGeneration() {
+    if (!isStreaming) return;
+
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+    if (currentStreamReader) {
+        currentStreamReader.cancel();
+    }
+}
+
+function updateSendButtonState() {
+    const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
+
+    if (isStreaming) {
+        sendBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+        stopBtn.disabled = false;
+    } else {
+        sendBtn.style.display = 'block';
+        stopBtn.style.display = 'none';
+        sendBtn.disabled = !currentTool || currentTool.tool_type === 'asr';
+    }
 }
