@@ -28,20 +28,31 @@ python main.py
 ### Docker 运行
 
 ```bash
-# 构建镜像
-docker build -t llm-toolbox .
 
 # 运行容器
 docker run -d \
   -p 8000:8000 \
   -v ./data:/app/data \
-  llm-toolbox
+  brantwang/llm-toolbox:v0.0.2
 ```
 
 ### Docker Compose
 
 ```bash
-APP_PORT=8000 docker-compose up -d
+services:
+  llm-toolbox:
+    image: brantwang/llm-toolbox:v0.0.2
+    container_name: llm-toolbox
+    ports:
+      - "${APP_PORT:-8000}:${APP_PORT:-8000}"
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=${APP_PORT:-8000}
+      - APP_RELOAD=false
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
 ```
 
 ## 环境变量

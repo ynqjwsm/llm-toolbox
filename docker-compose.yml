@@ -1,6 +1,6 @@
 services:
   llm-toolbox:
-    build: .
+    image: brantwang/llm-toolbox:v0.0.2
     container_name: llm-toolbox
     ports:
       - "${APP_PORT:-8000}:${APP_PORT:-8000}"

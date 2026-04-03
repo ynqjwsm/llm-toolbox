@@ -23,7 +23,7 @@ from database import (
     get_models, get_models_by_endpoint, get_model, get_model_with_endpoint,
     create_model, update_model, delete_model, create_models_batch,
     get_tools, get_tool, create_tool, update_tool, delete_tool,
-    get_conversations, get_conversation, create_conversation, add_message, delete_conversation
+    get_conversations, get_conversation, create_conversation, add_message, delete_conversation, update_messages
 )
 from llm import OpenAIClient, OllamaClient
 
@@ -307,6 +307,17 @@ async def list_conversations(tool_id: int = None):
     return await get_conversations(tool_id)
 
 
+@app.post("/api/conversations")
+async def create_new_conversation(request: Request):
+    """创建新对话"""
+    body = await request.json()
+    tool_id = body.get("tool_id")
+    if not tool_id:
+        raise HTTPException(status_code=400, detail="缺少tool_id")
+    conv = await create_conversation(tool_id)
+    return conv
+
+
 @app.get("/api/conversations/{id}")
 async def get_conversation_detail(id: int):
     """获取对话详情"""
@@ -322,6 +333,19 @@ async def remove_conversation(id: int):
     if not await delete_conversation(id):
         raise HTTPException(status_code=404, detail="对话不存在")
     return {"message": "删除成功"}
+
+
+@app.put("/api/conversations/{id}/messages")
+async def update_conversation_messages(id: int, request: Request):
+    """更新对话的消息列表（用于删除消息）"""
+    from models import Message
+    body = await request.json()
+    messages_data = body.get("messages", [])
+    messages = [Message(**msg) if isinstance(msg, dict) else msg for msg in messages_data]
+    result = await update_messages(id, messages)
+    if not result:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return {"message": "更新成功"}
 
 
 # ========== LLM客户端 ==========
@@ -379,6 +403,14 @@ async def stream_chat_generator(request: ChatRequest):
     client = get_llm_client(model_info)
     system_prompt = tool.system_prompt or ""
 
+    # Thinking工具的标记检测
+    # DeepSeek R1 格式: <|begin_of_thinking|> ... <|end_of_thinking|>
+    # 也支持: <think> ... </think>
+    THINKING_MARKERS = [
+        ("<|begin_of_thinking|>", "<|end_of_thinking|>"),
+        ("<think>", "</think>"),
+    ]
+
     try:
         if tool.tool_type == ToolType.OCR and request.image_url:
             full_response = []
@@ -390,6 +422,85 @@ async def stream_chat_generator(request: ChatRequest):
                 full_response.append(chunk)
                 yield f"data: {json.dumps({'content': chunk})}\n\n"
             response_text = "".join(full_response)
+        elif tool.tool_type == ToolType.THINKING:
+            # Thinking类型：分离思考内容和正文
+            full_response = []
+            thinking_content = []
+            in_thinking = False
+            buffer = ""
+            current_markers = None  # 当前使用的标记格式
+
+            async for chunk in client.chat_stream(messages, system_prompt):
+                full_response.append(chunk)
+                buffer += chunk
+
+                # 检测思考标记
+                while True:
+                    if not in_thinking:
+                        # 尝试匹配所有可能的开始标记
+                        matched_start = None
+                        matched_end = None
+                        start_idx = -1
+
+                        for start_marker, end_marker in THINKING_MARKERS:
+                            idx = buffer.find(start_marker)
+                            if idx != -1:
+                                if matched_start is None or idx < start_idx:
+                                    matched_start = start_marker
+                                    matched_end = end_marker
+                                    start_idx = idx
+
+                        if matched_start:
+                            current_markers = (matched_start, matched_end)
+                            # 标记之前的内容作为正文发送
+                            if start_idx > 0:
+                                before = buffer[:start_idx]
+                                yield f"data: {json.dumps({'content': before})}\n\n"
+                            buffer = buffer[start_idx + len(matched_start):]
+                            in_thinking = True
+                            yield f"data: {json.dumps({'thinking_start': True})}\n\n"
+                        else:
+                            # 检查是否可能有不完整的标记
+                            max_marker_len = max(len(m[0]) for m in THINKING_MARKERS)
+                            if len(buffer) > max_marker_len:
+                                safe_len = len(buffer) - max_marker_len
+                                safe_content = buffer[:safe_len]
+                                yield f"data: {json.dumps({'content': safe_content})}\n\n"
+                                buffer = buffer[safe_len:]
+                            break
+                    else:
+                        # 在思考区域内，查找对应的结束标记
+                        end_marker = current_markers[1] if current_markers else THINKING_MARKERS[0][1]
+                        end_idx = buffer.find(end_marker)
+
+                        if end_idx != -1:
+                            # 发送思考内容
+                            thinking_part = buffer[:end_idx]
+                            thinking_content.append(thinking_part)
+                            yield f"data: {json.dumps({'thinking': thinking_part})}\n\n"
+                            buffer = buffer[end_idx + len(end_marker):]
+                            in_thinking = False
+                            current_markers = None
+                            yield f"data: {json.dumps({'thinking_end': True})}\n\n"
+                        else:
+                            # 检查是否可能有不完整的标记
+                            if len(buffer) > len(end_marker):
+                                safe_len = len(buffer) - len(end_marker)
+                                safe_thinking = buffer[:safe_len]
+                                thinking_content.append(safe_thinking)
+                                yield f"data: {json.dumps({'thinking': safe_thinking})}\n\n"
+                                buffer = buffer[safe_len:]
+                            break
+
+            # 处理剩余buffer
+            if buffer:
+                if in_thinking:
+                    thinking_content.append(buffer)
+                    yield f"data: {json.dumps({'thinking': buffer})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'content': buffer})}\n\n"
+
+            response_text = "".join(full_response)
         else:
             full_response = []
             async for chunk in client.chat_stream(messages, system_prompt):
@@ -397,7 +508,14 @@ async def stream_chat_generator(request: ChatRequest):
                 yield f"data: {json.dumps({'content': chunk})}\n\n"
             response_text = "".join(full_response)
 
-        assistant_message = Message(role="assistant", content=response_text)
+        # 保存assistant消息（清理思考标记后）
+        if tool.tool_type == ToolType.THINKING:
+            clean_response = response_text
+            for start_marker, end_marker in THINKING_MARKERS:
+                clean_response = clean_response.replace(start_marker, "").replace(end_marker, "")
+        else:
+            clean_response = response_text
+        assistant_message = Message(role="assistant", content=clean_response)
         await add_message(conversation.id, assistant_message)
 
         yield f"data: {json.dumps({'done': True, 'conversation_id': conversation.id})}\n\n"

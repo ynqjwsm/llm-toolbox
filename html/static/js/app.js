@@ -13,6 +13,8 @@ let isStreaming = false;
 let uploadedImageUrl = null;
 let endpoints = [];
 let models = [];
+let currentThinkingContent = '';
+let isInThinkingBlock = false;
 
 // 流式输出控制
 let currentAbortController = null;
@@ -39,11 +41,41 @@ let fetchedModels = [];
 // ========== 初始化 ==========
 
 document.addEventListener('DOMContentLoaded', async () => {
+    initTheme();
     await loadEndpoints();
     await loadModels();
     await loadTools();
     setupEventListeners();
 });
+
+window.addEventListener('beforeunload', () => {
+    if (isTemporaryConversation) {
+        isTemporaryConversation = false;
+        currentConversationId = null;
+    }
+});
+
+// ========== 主题切换 ==========
+
+function initTheme() {
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    if (savedTheme === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+    }
+}
+
+function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-theme');
+    if (currentTheme === 'light') {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('theme', 'dark');
+        showToast('已切换到深色主题');
+    } else {
+        document.documentElement.setAttribute('data-theme', 'light');
+        localStorage.setItem('theme', 'light');
+        showToast('已切换到亮色主题');
+    }
+}
 
 function setupEventListeners() {
     const chatInput = document.getElementById('chat-input');
@@ -56,11 +88,12 @@ function setupEventListeners() {
 
     chatInput.addEventListener('input', () => {
         chatInput.style.height = 'auto';
-        chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+        chatInput.style.height = Math.min(chatInput.scrollHeight, 160) + 'px';
     });
 
     document.getElementById('image-input').addEventListener('change', handleImageUpload);
     document.getElementById('asr-file-input').addEventListener('change', handleASRFileSelect);
+    document.getElementById('ocr-file-input').addEventListener('change', handleOCRFileSelect);
 
     document.querySelectorAll('input[name="tool-type-radio"]').forEach(radio => {
         radio.addEventListener('change', () => {
@@ -674,6 +707,7 @@ async function selectTool(id) {
 
         currentTool = tool;
         currentConversationId = null;
+        isTemporaryConversation = false;
         asrPendingFiles = [];
         asrResults = [];
         ocrPendingFiles = [];
@@ -835,6 +869,290 @@ function clearChat() {
     if (ocrProgress) ocrProgress.style.display = 'none';
     updateASRFileList();
     updateOCRFileList();
+    disableMessageDeleteMode();
+}
+
+// ========== 会话管理 ==========
+
+let isTemporaryConversation = false;
+let isMessageDeleteMode = false;
+let contextMenuTargetId = null;
+
+function clearChatWithConfirm() {
+    if (!currentTool) {
+        showToast('请先选择一个工具', 'error');
+        return;
+    }
+    if (!confirm('确定清空当前会话？')) return;
+    clearChat();
+    showToast('会话已清空');
+}
+
+async function newConversation() {
+    if (!currentTool) {
+        showToast('请先选择一个工具', 'error');
+        return;
+    }
+    isTemporaryConversation = false;
+    clearChat();
+    try {
+        const response = await fetch('/api/conversations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool_id: currentTool.id })
+        });
+        const conv = await response.json();
+        currentConversationId = conv.id;
+        await loadConversations(currentTool.id);
+        showToast('已创建新会话');
+    } catch (error) {
+        console.error('创建新会话失败:', error);
+        showToast('创建失败', 'error');
+    }
+}
+
+function startTemporaryChat() {
+    if (!currentTool) {
+        showToast('请先选择一个工具', 'error');
+        return;
+    }
+    isTemporaryConversation = true;
+    clearChat();
+    currentConversationId = null;
+    // 在历史列表显示临时会话指示
+    renderTemporaryIndicator();
+    showToast('临时会话已创建（关闭工具后自动清除）');
+}
+
+function renderTemporaryIndicator() {
+    const list = document.getElementById('conversation-list');
+    if (isTemporaryConversation && currentTool) {
+        list.innerHTML = `
+            <div class="sidebar-item temporary active">
+                <div class="item-left">
+                    <div class="item-icon">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                    </div>
+                    <span class="item-name">临时会话</span>
+                </div>
+            </div>
+        `;
+    }
+}
+
+// ========== 消息删除模式 ==========
+
+function enableMessageDeleteMode() {
+    if (!currentTool) {
+        showToast('请先选择一个工具', 'error');
+        return;
+    }
+    // 幂等检查：如果已经处于删除模式，直接返回
+    if (isMessageDeleteMode) {
+        return;
+    }
+    const messagesContainer = document.getElementById('chat-messages');
+    const messages = messagesContainer.querySelectorAll('.message');
+    if (messages.length === 0) {
+        showToast('当前没有消息可删除', 'error');
+        return;
+    }
+    isMessageDeleteMode = true;
+    messagesContainer.classList.add('message-delete-mode');
+    document.getElementById('delete-mode-bar').classList.add('active');
+    messages.forEach(msg => {
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'message-checkbox';
+        checkbox.addEventListener('change', updateSelectedCount);
+        msg.insertBefore(checkbox, msg.firstChild);
+    });
+    // 更新按钮状态为激活样式
+    const btn = document.getElementById('delete-mode-btn');
+    if (btn) btn.classList.add('active');
+    showToast('已进入删除模式，勾选要删除的消息');
+}
+
+function disableMessageDeleteMode() {
+    isMessageDeleteMode = false;
+    const messagesContainer = document.getElementById('chat-messages');
+    messagesContainer.classList.remove('message-delete-mode');
+    messagesContainer.querySelectorAll('.message-checkbox').forEach(cb => cb.remove());
+    document.getElementById('delete-mode-bar').classList.remove('active');
+    document.getElementById('selected-count').textContent = '0';
+    // 更新按钮状态为非激活样式
+    const btn = document.getElementById('delete-mode-btn');
+    if (btn) btn.classList.remove('active');
+}
+
+function updateSelectedCount() {
+    const checked = document.querySelectorAll('.message-checkbox:checked');
+    document.getElementById('selected-count').textContent = checked.length;
+}
+
+async function deleteSelectedMessages() {
+    if (!currentConversationId) {
+        showToast('当前不是已保存的会话', 'error');
+        disableMessageDeleteMode();
+        return;
+    }
+    const checkboxes = document.querySelectorAll('.message-checkbox:checked');
+    if (checkboxes.length === 0) {
+        showToast('请勾选要删除的消息', 'error');
+        return;
+    }
+    const count = checkboxes.length;
+    document.getElementById('delete-count').textContent = count;
+    const modal = new bootstrap.Modal(document.getElementById('deleteMessagesModal'));
+    modal.show();
+}
+
+async function confirmDeleteMessages() {
+    const checkboxes = document.querySelectorAll('.message-checkbox:checked');
+    const messagesContainer = document.getElementById('chat-messages');
+    const allMessages = Array.from(messagesContainer.querySelectorAll('.message'));
+
+    // 获取要删除的索引
+    const deleteIndices = new Set();
+    checkboxes.forEach(cb => {
+        const msg = cb.closest('.message');
+        const idx = allMessages.indexOf(msg);
+        if (idx >= 0) deleteIndices.add(idx);
+    });
+
+    if (!currentConversationId || isTemporaryConversation) {
+        // 临时会话：直接从DOM删除
+        checkboxes.forEach(cb => {
+            const msg = cb.closest('.message');
+            if (msg) msg.remove();
+        });
+        disableMessageDeleteMode();
+        const modal = bootstrap.Modal.getInstance(document.getElementById('deleteMessagesModal'));
+        modal.hide();
+        showToast(`已删除 ${deleteIndices.size} 条消息`);
+        return;
+    }
+
+    // 获取当前消息列表，过滤掉要删除的
+    try {
+        const response = await fetch(`/api/conversations/${currentConversationId}`);
+        const conv = await response.json();
+        // 只保留assistant消息（user消息也有，按顺序过滤）
+        const assistantMessages = conv.messages.filter(m => m.role === 'assistant');
+        const userMessages = conv.messages.filter(m => m.role === 'user');
+
+        // 简单处理：重新获取完整消息列表，按DOM顺序匹配
+        const newMessages = [];
+        allMessages.forEach((msg, idx) => {
+            if (!deleteIndices.has(idx)) {
+                const contentEl = msg.querySelector('.message-content');
+                const textarea = msg.querySelector('textarea.d-none');
+                const isUser = msg.classList.contains('user');
+                if (contentEl && textarea) {
+                    newMessages.push({ role: isUser ? 'user' : 'assistant', content: textarea.value });
+                } else if (contentEl) {
+                    // 没有textarea的情况（如OCR/ASR结果）
+                    newMessages.push({ role: isUser ? 'user' : 'assistant', content: contentEl.textContent });
+                }
+            }
+        });
+
+        const updateResponse = await fetch(`/api/conversations/${currentConversationId}/messages`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: newMessages })
+        });
+
+        if (updateResponse.ok) {
+            // 从DOM删除
+            checkboxes.forEach(cb => {
+                const msg = cb.closest('.message');
+                if (msg) msg.remove();
+            });
+            showToast(`已删除 ${deleteIndices.size} 条消息`);
+        } else {
+            showToast('更新失败', 'error');
+        }
+    } catch (error) {
+        console.error('删除消息失败:', error);
+        showToast('删除失败', 'error');
+    }
+
+    disableMessageDeleteMode();
+    const modal = bootstrap.Modal.getInstance(document.getElementById('deleteMessagesModal'));
+    modal.hide();
+}
+
+// ========== 右键上下文菜单 ==========
+
+document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('contextmenu', (e) => {
+        const messageEl = e.target.closest('.message');
+        if (!messageEl || isMessageDeleteMode) return;
+        e.preventDefault();
+        contextMenuTargetId = messageEl.querySelector('textarea.d-none')?.id;
+        const menu = document.getElementById('context-menu');
+        menu.style.display = 'block';
+        menu.style.left = e.clientX + 'px';
+        menu.style.top = e.clientY + 'px';
+    });
+
+    document.addEventListener('click', () => {
+        document.getElementById('context-menu').style.display = 'none';
+    });
+});
+
+function contextMenuAction(action) {
+    document.getElementById('context-menu').style.display = 'none';
+    if (action === 'copy' && contextMenuTargetId) {
+        copyText(contextMenuTargetId);
+    } else if (action === 'copyMd' && contextMenuTargetId) {
+        copyMarkdown(contextMenuTargetId);
+    } else if (action === 'delete') {
+        const messageEl = document.getElementById(contextMenuTargetId)?.closest('.message');
+        if (!messageEl) return;
+        if (!confirm('确定删除此消息？')) return;
+
+        if (!currentConversationId || isTemporaryConversation) {
+            messageEl.remove();
+            showToast('消息已删除');
+            return;
+        }
+
+        // 从数据库删除
+        fetch(`/api/conversations/${currentConversationId}`)
+            .then(r => r.json())
+            .then(conv => {
+                const allMessages = Array.from(document.getElementById('chat-messages').querySelectorAll('.message'));
+                const targetIdx = allMessages.indexOf(messageEl);
+                const newMessages = [];
+                allMessages.forEach((msg, idx) => {
+                    if (idx !== targetIdx) {
+                        const textarea = msg.querySelector('textarea.d-none');
+                        const isUser = msg.classList.contains('user');
+                        if (textarea) {
+                            newMessages.push({ role: isUser ? 'user' : 'assistant', content: textarea.value });
+                        }
+                    }
+                });
+                return fetch(`/api/conversations/${currentConversationId}/messages`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: newMessages })
+                });
+            })
+            .then(r => {
+                if (r.ok) {
+                    document.getElementById(contextMenuTargetId)?.closest('.message')?.remove();
+                    showToast('消息已删除');
+                }
+            })
+            .catch(err => {
+                console.error('删除消息失败:', err);
+                showToast('删除失败', 'error');
+            });
+    }
+    contextMenuTargetId = null;
 }
 
 // ========== 图片处理 ==========
@@ -1284,9 +1602,21 @@ function appendASRResult(filename, text) {
             <div class="message-title">${escapeHtml(filename)}</div>
             <div class="message-content">${formatMarkdown(text)}</div>
             <div class="message-actions">
-                <button class="btn" onclick="copyText('${resultId}')">
+                <button class="btn" onclick="copyText('${resultId}')" title="复制纯文本">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    复制
+                    纯文本
+                </button>
+                <button class="btn" onclick="copyMarkdown('${resultId}')" title="复制Markdown">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+                    Markdown
+                </button>
+                <button class="btn" onclick="exportTxt('${resultId}', '${escapeHtml(filename)}')" title="导出TXT">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    TXT
+                </button>
+                <button class="btn" onclick="exportDocx('${resultId}', '${escapeHtml(filename)}')" title="导出DOCX">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    DOCX
                 </button>
             </div>
         </div>
@@ -1313,9 +1643,21 @@ function appendOCRResult(filename, text, isStreaming = false) {
             <div class="message-title">${escapeHtml(filename)}</div>
             <div class="message-content">${isStreaming ? '' : formatMarkdown(text)}${isStreaming ? '<span class="typing-indicator">\u258B</span>' : ''}</div>
             <div class="message-actions" style="display: ${isStreaming ? 'none' : 'flex'};">
-                <button class="btn" onclick="copyOCRText('${resultId}')">
+                <button class="btn" onclick="copyText('${resultId}')" title="复制纯文本">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    复制
+                    纯文本
+                </button>
+                <button class="btn" onclick="copyMarkdown('${resultId}')" title="复制Markdown">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+                    Markdown
+                </button>
+                <button class="btn" onclick="exportTxt('${resultId}', '${escapeHtml(filename)}')" title="导出TXT">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    TXT
+                </button>
+                <button class="btn" onclick="exportDocx('${resultId}', '${escapeHtml(filename)}')" title="导出DOCX">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    DOCX
                 </button>
             </div>
         </div>
@@ -1337,27 +1679,29 @@ function updateOCRResultActions(div, filename, text) {
 
     textarea.value = text;
 
+    const resultId = textarea.id;
     actionsDiv.style.display = 'flex';
     actionsDiv.innerHTML = `
-        <button class="btn" onclick="copyOCRText('${textarea.id}')">
+        <button class="btn" onclick="copyText('${resultId}')" title="复制纯文本">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            复制
+            纯文本
+        </button>
+        <button class="btn" onclick="copyMarkdown('${resultId}')" title="复制Markdown">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+            Markdown
+        </button>
+        <button class="btn" onclick="exportTxt('${resultId}', '${escapeHtml(filename)}')" title="导出TXT">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            TXT
+        </button>
+        <button class="btn" onclick="exportDocx('${resultId}', '${escapeHtml(filename)}')" title="导出DOCX">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            DOCX
         </button>
     `;
 }
 
-function copyOCRText(elementId) {
-    const textarea = document.getElementById(elementId);
-    if (!textarea) return;
-    navigator.clipboard.writeText(textarea.value).then(() => {
-        showToast('已复制到剪贴板');
-    }).catch(err => {
-        console.error('复制失败:', err);
-        showToast('复制失败', 'error');
-    });
-}
-
-function appendMessage(role, content, isStreaming = false, title = null) {
+function appendMessage(role, content, isStreaming = false, title = null, isThinkingTool = false) {
     const messagesDiv = document.getElementById('chat-messages');
     const welcome = messagesDiv.querySelector('.welcome-screen');
     if (welcome) welcome.remove();
@@ -1365,21 +1709,85 @@ function appendMessage(role, content, isStreaming = false, title = null) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
     const titleHtml = title ? `<div class="message-title">${title}</div>` : '';
+    const msgId = generateId('msg');
 
     const avatarSVG = role === 'user'
         ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
         : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/><path d="M8 16h.01"/><path d="M12 16h.01"/><path d="M16 16h.01"/></svg>';
 
+    const isAssistant = role === 'assistant';
+
+    // 思考区域HTML（仅thinking工具显示）
+    const thinkingHtml = isAssistant && isThinkingTool ? `
+        <div class="thinking-section" style="display: none;">
+            <div class="thinking-header" onclick="toggleThinkingSection(this.parentElement)">
+                <span class="thinking-toggle">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                </span>
+                <span class="thinking-label">思考过程</span>
+            </div>
+            <div class="thinking-content"></div>
+        </div>
+    ` : '';
+    if (isThinkingTool && isAssistant) {
+        console.log('Created thinking section HTML for message');
+    }
+
+    const actionsHtml = isAssistant ? `
+        <div class="message-actions" style="display: ${isStreaming ? 'none' : 'flex'};">
+            <button class="btn" onclick="copyText('${msgId}')" title="复制纯文本">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                纯文本
+            </button>
+            <button class="btn" onclick="copyMarkdown('${msgId}')" title="复制Markdown">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+                Markdown
+            </button>
+            <button class="btn" onclick="exportTxt('${msgId}', '${msgId}')" title="导出TXT">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                TXT
+            </button>
+            <button class="btn" onclick="exportDocx('${msgId}', '${msgId}')" title="导出DOCX">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                DOCX
+            </button>
+        </div>
+    ` : '';
+
     div.innerHTML = `
         <div class="message-avatar">${avatarSVG}</div>
         <div class="message-content-wrapper">
             ${titleHtml}
+            ${thinkingHtml}
             <div class="message-content">${formatMarkdown(content)}${isStreaming ? '<span class="typing-indicator">\u258B</span>' : ''}</div>
+            ${actionsHtml}
         </div>
     `;
+
+    if (isAssistant) {
+        const textarea = document.createElement('textarea');
+        textarea.id = msgId;
+        textarea.className = 'd-none';
+        textarea.value = content;
+        div.querySelector('.message-content-wrapper').appendChild(textarea);
+    }
+
     messagesDiv.appendChild(div);
     scrollToBottom();
     return div;
+}
+
+function toggleThinkingSection(section) {
+    if (!section) return;
+    section.classList.toggle('collapsed');
+    const toggleIcon = section.querySelector('.thinking-toggle svg');
+    if (toggleIcon) {
+        if (section.classList.contains('collapsed')) {
+            toggleIcon.style.transform = 'rotate(-90deg)';
+        } else {
+            toggleIcon.style.transform = 'rotate(0deg)';
+        }
+    }
 }
 
 function scrollToBottom() {
@@ -1392,12 +1800,393 @@ function scrollToBottom() {
 function copyText(elementId) {
     const textarea = document.getElementById(elementId);
     if (!textarea) return;
-    navigator.clipboard.writeText(textarea.value).then(() => {
-        showToast('已复制到剪贴板');
+    const plainText = markdownToPlainText(textarea.value);
+    navigator.clipboard.writeText(plainText).then(() => {
+        showToast('已复制纯文本');
     }).catch(err => {
         console.error('复制失败:', err);
         showToast('复制失败', 'error');
     });
+}
+
+function copyMarkdown(elementId) {
+    const textarea = document.getElementById(elementId);
+    if (!textarea) return;
+    navigator.clipboard.writeText(textarea.value).then(() => {
+        showToast('已复制Markdown');
+    }).catch(err => {
+        console.error('复制失败:', err);
+        showToast('复制失败', 'error');
+    });
+}
+
+function exportTxt(elementId, filename) {
+    const textarea = document.getElementById(elementId);
+    if (!textarea) return;
+    const plainText = markdownToPlainText(textarea.value);
+    const blob = new Blob([plainText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (filename || 'export') + '.txt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('TXT导出成功');
+}
+
+/**
+ * 将Markdown文本转换为纯文本（去除Markdown标记）
+ */
+function markdownToPlainText(md) {
+    if (!md) return '';
+    let text = md;
+
+    // 代码块 - 保留内容但去掉标记
+    text = text.replace(/```[\w]*\n([\s\S]*?)```/g, '$1');
+
+    // 标题 - 去掉#号
+    text = text.replace(/^#{1,6}\s+(.*)$/gm, '$1');
+
+    // 粗斜体 - 去掉标记保留文字
+    text = text.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
+    text = text.replace(/\*\*([^*]+)\*\*/g, '$1');
+    text = text.replace(/\*([^*]+)\*/g, '$1');
+    text = text.replace(/___([^_]+)___/g, '$1');
+    text = text.replace(/__([^_]+)__/g, '$1');
+    text = text.replace(/_([^_]+)_/g, '$1');
+
+    // 删除线
+    text = text.replace(/~~([^~]+)~~/g, '$1');
+
+    // 行内代码
+    text = text.replace(/`([^`]+)`/g, '$1');
+
+    // 链接 - 保留显示文本
+    text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+
+    // 图片 - 保留alt文本
+    text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
+
+    // 块引用
+    text = text.replace(/^>\s*/gm, '');
+
+    // 无序列表标记
+    text = text.replace(/^[\s]*[-*+]\s+/gm, '  ');
+
+    // 有序列表标记
+    text = text.replace(/^[\s]*\d+\.\s+/gm, '  ');
+
+    // 水平线
+    text = text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '---');
+
+    // HTML标签
+    text = text.replace(/<[^>]+>/g, '');
+
+    // HTML实体
+    text = text.replace(/&nbsp;/g, ' ');
+    text = text.replace(/&amp;/g, '&');
+    text = text.replace(/&lt;/g, '<');
+    text = text.replace(/&gt;/g, '>');
+    text = text.replace(/&quot;/g, '"');
+    text = text.replace(/&#39;/g, "'");
+
+    return text;
+}
+
+function exportDocx(elementId, filename) {
+    const textarea = document.getElementById(elementId);
+    if (!textarea) return;
+    if (typeof docx === 'undefined') {
+        showToast('DOCX库未加载，请刷新页面', 'error');
+        return;
+    }
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, BorderStyle, UnderlineType, ShadingType, NumberFormat, LevelFormat } = docx;
+
+    const markdown = textarea.value;
+    const children = markdownToDocxParagraphs(markdown);
+
+    const doc = new Document({
+        styles: {
+            paragraphStyles: [
+                {
+                    id: 'CodeBlock',
+                    name: 'Code Block',
+                    basedOn: 'Normal',
+                    run: {
+                        font: 'Consolas',
+                        size: 20,
+                        color: 'D4D4D4'
+                    },
+                    paragraph: {
+                        spacing: { before: 60, after: 60, line: 280 },
+                        indent: { left: 480, right: 480 },
+                        shading: { type: ShadingType.CLEAR, fill: '1E1E1E' }
+                    }
+                }
+            ]
+        },
+        sections: [{
+            properties: {},
+            children: children.length > 0 ? children : [new Paragraph('')]
+        }]
+    });
+
+    Packer.toBlob(doc).then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = (filename || 'export') + '.docx';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast('DOCX导出成功');
+    }).catch(err => {
+        console.error('DOCX导出失败:', err);
+        showToast('DOCX导出失败', 'error');
+    });
+}
+
+function markdownToDocxParagraphs(markdown) {
+    const { Paragraph, TextRun, HeadingLevel, AlignmentType, BorderStyle, UnderlineType, ShadingType, NumberFormat, LevelFormat } = docx;
+    const lines = markdown.split('\n');
+    const children = [];
+    let inCodeBlock = false;
+    let codeLines = [];
+    let codeLanguage = '';
+
+    function flushCodeBlock() {
+        if (codeLines.length === 0) return;
+        const codeText = codeLines.join('\n');
+        children.push(new Paragraph({
+            style: 'CodeBlock',
+            children: [new TextRun(codeText)],
+            spacing: { before: 120, after: 120 }
+        }));
+        codeLines = [];
+    }
+
+    function parseInlineMarkdown(text) {
+        const runs = [];
+        const regex = /(\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|~~[^~]+~~)/g;
+        let lastIndex = 0;
+        let match;
+
+        while ((match = regex.exec(text)) !== null) {
+            if (match.index > lastIndex) {
+                runs.push(new TextRun(text.substring(lastIndex, match.index)));
+            }
+            const token = match[0];
+            if (token.startsWith('***') && token.endsWith('***')) {
+                runs.push(new TextRun(token.slice(3, -3), { bold: true, italics: true }));
+            } else if (token.startsWith('**') && token.endsWith('**')) {
+                runs.push(new TextRun(token.slice(2, -2), { bold: true }));
+            } else if (token.startsWith('*') && token.endsWith('*') && !token.startsWith('**')) {
+                runs.push(new TextRun(token.slice(1, -1), { italics: true }));
+            } else if (token.startsWith('`') && token.endsWith('`')) {
+                runs.push(new TextRun(token.slice(1, -1), {
+                    font: 'Consolas',
+                    size: 20,
+                    shading: { type: ShadingType.CLEAR, fill: 'F0F0F0' }
+                }));
+            } else if (token.startsWith('~~') && token.endsWith('~~')) {
+                runs.push(new TextRun(token.slice(2, -2), { strike: true }));
+            }
+            lastIndex = regex.lastIndex;
+        }
+
+        if (lastIndex < text.length) {
+            runs.push(new TextRun(text.substring(lastIndex)));
+        }
+        return runs.length > 0 ? runs : [new TextRun('')];
+    }
+
+    // Ordered/unordered list tracking
+    let listCounter = 0;
+    let inList = false;
+    let listType = ''; // 'ordered' or 'unordered'
+
+    function flushList() {
+        listCounter = 0;
+        inList = false;
+        listType = '';
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Code block
+        if (line.startsWith('```')) {
+            if (inCodeBlock) {
+                flushCodeBlock();
+                inCodeBlock = false;
+            } else {
+                inCodeBlock = true;
+                codeLanguage = line.slice(3).trim();
+            }
+            continue;
+        }
+
+        if (inCodeBlock) {
+            codeLines.push(line);
+            continue;
+        }
+
+        // Headings
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)/);
+        if (headingMatch) {
+            flushList();
+            const level = headingMatch[1].length;
+            const headingText = headingMatch[2].replace(/[#\s]*$/, '');
+            const headingMap = {
+                1: HeadingLevel.HEADING_1,
+                2: HeadingLevel.HEADING_2,
+                3: HeadingLevel.HEADING_3,
+                4: HeadingLevel.HEADING_4,
+                5: HeadingLevel.HEADING_5,
+                6: HeadingLevel.HEADING_6
+            };
+            children.push(new Paragraph({
+                heading: headingMap[level],
+                children: parseInlineMarkup(headingText),
+                spacing: { before: level <= 2 ? 240 : 180, after: 120 }
+            }));
+            continue;
+        }
+
+        // Horizontal rule
+        if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+            flushList();
+            children.push(new Paragraph({
+                children: [],
+                border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: 'CCCCCC' } },
+                spacing: { before: 120, after: 120 }
+            }));
+            continue;
+        }
+
+        // Empty line
+        if (line.trim() === '') {
+            flushList();
+            children.push(new Paragraph({ spacing: { after: 80 } }));
+            continue;
+        }
+
+        // Ordered list
+        const orderedMatch = line.match(/^(\d+)\.\s+(.*)/);
+        if (orderedMatch) {
+            if (!inList || listType !== 'ordered') {
+                flushList();
+                inList = true;
+                listType = 'ordered';
+                listCounter = 0;
+            }
+            listCounter++;
+            children.push(new Paragraph({
+                children: parseInlineMarkup(orderedMatch[2]),
+                indent: { left: 720, hanging: 360 },
+                spacing: { after: 40 }
+            }));
+            continue;
+        }
+
+        // Unordered list
+        const unorderedMatch = line.match(/^[-*+]\s+(.*)/);
+        if (unorderedMatch) {
+            if (!inList || listType !== 'unordered') {
+                flushList();
+                inList = true;
+                listType = 'unordered';
+            }
+            children.push(new Paragraph({
+                children: [
+                    new TextRun('\u2022 ', { size: 22 }),
+                    ...parseInlineMarkup(unorderedMatch[1])
+                ],
+                indent: { left: 720, hanging: 360 },
+                spacing: { after: 40 }
+            }));
+            continue;
+        }
+
+        // Block quote
+        if (line.startsWith('>')) {
+            flushList();
+            const quoteText = line.replace(/^>\s*/, '');
+            children.push(new Paragraph({
+                children: parseInlineMarkup(quoteText),
+                indent: { left: 480 },
+                border: { left: { style: BorderStyle.SINGLE, size: 8, color: '999999' } },
+                spacing: { before: 60, after: 60 }
+            }));
+            continue;
+        }
+
+        // Normal paragraph
+        flushList();
+        children.push(new Paragraph({
+            children: parseInlineMarkup(line),
+            spacing: { after: 80 }
+        }));
+    }
+
+    if (inCodeBlock) flushCodeBlock();
+    flushList();
+
+    return children;
+}
+
+function parseInlineMarkup(text) {
+    const { TextRun, ShadingType } = docx;
+    const runs = [];
+    const regex = /(\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|~~[^~]+~~|!\[[^\]]*\]\([^)]*\)|\[[^\]]*\]\([^)]*\))/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            runs.push(new TextRun(text.substring(lastIndex, match.index)));
+        }
+        const token = match[0];
+        if (token.startsWith('***') && token.endsWith('***')) {
+            runs.push(new TextRun(token.slice(3, -3), { bold: true, italics: true }));
+        } else if (token.startsWith('**') && token.endsWith('**')) {
+            runs.push(new TextRun(token.slice(2, -2), { bold: true }));
+        } else if (token.startsWith('*') && token.endsWith('*') && !token.startsWith('**')) {
+            runs.push(new TextRun(token.slice(1, -1), { italics: true }));
+        } else if (token.startsWith('`') && token.endsWith('`')) {
+            runs.push(new TextRun(token.slice(1, -1), {
+                font: 'Consolas',
+                size: 20,
+                shading: { type: ShadingType.CLEAR, fill: 'F0F0F0' }
+            }));
+        } else if (token.startsWith('~~') && token.endsWith('~~')) {
+            runs.push(new TextRun(token.slice(2, -2), { strike: true }));
+        } else if (token.startsWith('![')) {
+            // Image: extract alt text
+            const altMatch = token.match(/!\[([^\]]*)\]/);
+            if (altMatch && altMatch[1]) {
+                runs.push(new TextRun(`[图片: ${altMatch[1]}]`, { italics: true, color: '666666' }));
+            }
+        } else if (token.startsWith('[')) {
+            // Link
+            const linkMatch = token.match(/\[([^\]]*)\]\(([^)]*)\)/);
+            if (linkMatch) {
+                runs.push(new TextRun(linkMatch[1], {
+                    color: '0563C1',
+                    underline: { type: UnderlineType.SINGLE }
+                }));
+            }
+        }
+        lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+        runs.push(new TextRun(text.substring(lastIndex)));
+    }
+    return runs.length > 0 ? runs : [new TextRun('')];
 }
 
 // ========== 工具函数 ==========
@@ -1438,8 +2227,12 @@ async function sendMessage() {
     input.value = '';
     input.style.height = 'auto';
 
-    currentAssistantDiv = appendMessage('assistant', '', true);
+    // 为thinking类型工具创建特殊的消息结构
+    const isThinkingTool = currentTool.tool_type === 'thinking';
+    currentAssistantDiv = appendMessage('assistant', '', true, null, isThinkingTool);
     currentContent = '';
+    currentThinkingContent = '';
+    isInThinkingBlock = false;
 
     isStreaming = true;
     updateSendButtonState();
@@ -1462,6 +2255,7 @@ async function sendMessage() {
         currentStreamReader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        let thinkingCollapsed = false;
 
         while (true) {
             const { done, value } = await currentStreamReader.read();
@@ -1480,16 +2274,93 @@ async function sendMessage() {
                         if (data.error) {
                             throw new Error(data.error);
                         }
+                        // 思考开始标记
+                        if (data.thinking_start) {
+                            console.log('Received thinking_start event');
+                            isInThinkingBlock = true;
+                            const thinkingSection = currentAssistantDiv.querySelector('.thinking-section');
+                            if (thinkingSection) {
+                                thinkingSection.style.display = 'block';
+                                thinkingSection.classList.remove('collapsed');
+                                const toggleIcon = thinkingSection.querySelector('.thinking-toggle svg');
+                                if (toggleIcon) {
+                                    toggleIcon.style.transform = 'rotate(0deg)';
+                                }
+                                console.log('Thinking section shown');
+                            } else {
+                                console.log('Thinking section not found!');
+                            }
+                        }
+                        // 思考内容
+                        if (data.thinking) {
+                            currentThinkingContent += data.thinking;
+                            console.log('Thinking content received, total length:', currentThinkingContent.length);
+                            const thinkingContentDiv = currentAssistantDiv.querySelector('.thinking-content');
+                            if (thinkingContentDiv) {
+                                thinkingContentDiv.innerHTML = formatMarkdown(currentThinkingContent) + '<span class="typing-indicator">\u258B</span>';
+                                scrollToBottom();
+                            }
+                        }
+                        // 思考结束标记
+                        if (data.thinking_end) {
+                            isInThinkingBlock = false;
+                            const thinkingContentDiv = currentAssistantDiv.querySelector('.thinking-content');
+                            if (thinkingContentDiv) {
+                                thinkingContentDiv.innerHTML = formatMarkdown(currentThinkingContent);
+                            }
+                        }
+                        // 正文内容
                         if (data.content) {
                             currentContent += data.content;
-                            currentAssistantDiv.querySelector('.message-content').innerHTML =
-                                formatMarkdown(currentContent) + '<span class="typing-indicator">\u258B</span>';
-                            scrollToBottom();
+                            // 当正文开始输出时，自动折叠思考区域
+                            if (isThinkingTool && !thinkingCollapsed && currentContent && currentThinkingContent) {
+                                thinkingCollapsed = true;
+                                const thinkingSection = currentAssistantDiv.querySelector('.thinking-section');
+                                if (thinkingSection) {
+                                    thinkingSection.classList.add('collapsed');
+                                    const toggleIcon = thinkingSection.querySelector('.thinking-toggle svg');
+                                    if (toggleIcon) {
+                                        toggleIcon.style.transform = 'rotate(-90deg)';
+                                    }
+                                }
+                            }
+                            const contentDiv = currentAssistantDiv.querySelector('.message-content');
+                            if (contentDiv) {
+                                contentDiv.innerHTML = formatMarkdown(currentContent) + '<span class="typing-indicator">\u258B</span>';
+                                scrollToBottom();
+                            }
                         }
                         if (data.done) {
-                            currentConversationId = data.conversation_id;
-                            currentAssistantDiv.querySelector('.message-content').innerHTML = formatMarkdown(currentContent);
-                            await loadConversations(currentTool.id);
+                            // 临时会话不保存conversation_id，不重载历史列表
+                            if (!isTemporaryConversation && data.conversation_id) {
+                                currentConversationId = data.conversation_id;
+                                await loadConversations(currentTool.id);
+                            }
+                            // 最终渲染
+                            const contentDiv = currentAssistantDiv.querySelector('.message-content');
+                            if (contentDiv) {
+                                contentDiv.innerHTML = formatMarkdown(currentContent);
+                            }
+                            const thinkingContentDiv = currentAssistantDiv.querySelector('.thinking-content');
+                            if (thinkingContentDiv) {
+                                thinkingContentDiv.innerHTML = formatMarkdown(currentThinkingContent);
+                            }
+                            // 确保思考区域折叠
+                            if (isThinkingTool && currentThinkingContent) {
+                                const thinkingSection = currentAssistantDiv.querySelector('.thinking-section');
+                                if (thinkingSection) {
+                                    thinkingSection.classList.add('collapsed');
+                                    const toggleIcon = thinkingSection.querySelector('.thinking-toggle svg');
+                                    if (toggleIcon) {
+                                        toggleIcon.style.transform = 'rotate(-90deg)';
+                                    }
+                                }
+                            }
+                            // 更新隐藏textarea并显示操作按钮
+                            const textarea = currentAssistantDiv.querySelector('textarea.d-none');
+                            if (textarea) textarea.value = currentContent;
+                            const actions = currentAssistantDiv.querySelector('.message-actions');
+                            if (actions) actions.style.display = 'flex';
                         }
                     } catch (e) {
                         if (e.name === 'SyntaxError') continue; // 解析错误，忽略
@@ -1500,19 +2371,33 @@ async function sendMessage() {
         }
     } catch (error) {
         if (error.name === 'AbortError') {
-            currentAssistantDiv.querySelector('.message-content').innerHTML =
-                formatMarkdown(currentContent) + '<div style="color:var(--text-muted);font-size:11px;margin-top:6px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-1px;margin-right:4px;"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>已停止</div>';
+            const contentDiv = currentAssistantDiv.querySelector('.message-content');
+            if (contentDiv) {
+                contentDiv.innerHTML = formatMarkdown(currentContent) + '<div style="color:var(--text-muted);font-size:11px;margin-top:6px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-1px;margin-right:4px;"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>已停止</div>';
+            }
+            const thinkingContentDiv = currentAssistantDiv.querySelector('.thinking-content');
+            if (thinkingContentDiv) {
+                thinkingContentDiv.innerHTML = formatMarkdown(currentThinkingContent);
+            }
+            // 更新隐藏textarea并显示操作按钮
+            const textarea = currentAssistantDiv.querySelector('textarea.d-none');
+            if (textarea) textarea.value = currentContent;
+            const actions = currentAssistantDiv.querySelector('.message-actions');
+            if (actions) actions.style.display = 'flex';
             showToast('已停止生成');
         } else {
             console.error('发送消息失败:', error);
-            currentAssistantDiv.querySelector('.message-content').innerHTML =
-                `<span style="color:var(--red)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M18.36 6.64A9 9 0 1 1 5.64 6.64"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>${currentContent ? '错误: ' + escapeHtml(error.message) : '连接失败'}</span>`;
+            const contentDiv = currentAssistantDiv.querySelector('.message-content');
+            if (contentDiv) {
+                contentDiv.innerHTML = `<span style="color:var(--red)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M18.36 6.64A9 9 0 1 1 5.64 6.64"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>${currentContent ? '错误: ' + escapeHtml(error.message) : '连接失败'}</span>`;
+            }
         }
     }
 
     isStreaming = false;
     currentAbortController = null;
     currentStreamReader = null;
+    isInThinkingBlock = false;
     updateSendButtonState();
     removeImage();
 }
@@ -1529,16 +2414,29 @@ function stopGeneration() {
 }
 
 function updateSendButtonState() {
-    const sendBtn = document.getElementById('send-btn');
-    const stopBtn = document.getElementById('stop-btn');
+    const actionBtn = document.getElementById('action-btn');
+    const iconSend = actionBtn.querySelector('.icon-send');
+    const iconStop = actionBtn.querySelector('.icon-stop');
 
     if (isStreaming) {
-        sendBtn.style.display = 'none';
-        stopBtn.style.display = 'block';
-        stopBtn.disabled = false;
+        // 停止状态
+        actionBtn.classList.add('is-stopping');
+        actionBtn.disabled = false;
+        iconSend.style.display = 'none';
+        iconStop.style.display = 'block';
     } else {
-        sendBtn.style.display = 'block';
-        stopBtn.style.display = 'none';
-        sendBtn.disabled = !currentTool || currentTool.tool_type === 'asr';
+        // 发送状态
+        actionBtn.classList.remove('is-stopping');
+        actionBtn.disabled = !currentTool || currentTool.tool_type === 'asr';
+        iconSend.style.display = 'block';
+        iconStop.style.display = 'none';
+    }
+}
+
+function handleAction() {
+    if (isStreaming) {
+        stopGeneration();
+    } else {
+        sendMessage();
     }
 }

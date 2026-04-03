@@ -533,3 +533,22 @@ async def delete_conversation(id: int) -> bool:
         cursor = await db.execute("DELETE FROM conversations WHERE id = ?", (id,))
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def update_messages(conversation_id: int, messages: List[Message]) -> Optional[Conversation]:
+    """更新对话的消息列表"""
+    conv = await get_conversation(conversation_id)
+    if not conv:
+        return None
+
+    conv.messages = messages
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE conversations SET messages=?, updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (json.dumps([m.model_dump() for m in conv.messages], cls=DateTimeEncoder), conversation_id)
+        )
+        await db.commit()
+
+    return conv
