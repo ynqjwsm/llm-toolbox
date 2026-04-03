@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 LABEL maintainer="llm-toolbox"
 
@@ -13,16 +13,15 @@ WORKDIR /app
 
 # 安装系统依赖
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg curl && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装Python依赖
-RUN pip install --no-cache-dir \
-    "fastapi[standard]>=0.115.0" \
-    pydantic>=2.0.0 \
-    jinja2>=3.1.2 \
-    aiosqlite>=0.20.0 \
-    httpx>=0.27.0
+ENV PATH="/root/.local/bin:$PATH"
+
+COPY pyproject.toml uv.lock* ./
+
+RUN uv pip install --system .
 
 # 复制项目代码
 COPY main.py models.py database.py ./
